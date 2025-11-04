@@ -18,7 +18,10 @@ from zipfile import is_zipfile, ZipFile
 import numpy as np
 import requests
 from filelock import FileLock
-from huggingface_hub.hf_api import HfFolder
+try:
+    from huggingface_hub.hf_api import HfFolder
+except ImportError:
+    from huggingface_hub import HfFolder
 from requests import HTTPError
 from tqdm import tqdm
 from transformers.dynamic_module_utils import custom_object_save
