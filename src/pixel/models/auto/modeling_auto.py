@@ -517,6 +517,7 @@ MODEL_FOR_BIAFFINE_PARSING_MAPPING_NAMES = OrderedDict(
         ("vit_mae", "PIXELForBiaffineParsing"),
         ("roberta", "RobertaForBiaffineParsing"),
         ("bert", "BertForBiaffineParsing"),
+        ("canine", "CanineForBiaffineParsing"),
     ]
 )
 
