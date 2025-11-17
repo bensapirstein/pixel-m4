@@ -9,6 +9,8 @@ import torch
 from filelock import FileLock
 from PIL import Image
 from transformers import PreTrainedTokenizerFast, is_torch_available
+from camel_tools.utils.charmap import CharMapper
+import arabic_reshaper
 
 from ...utils import Modality, Split, get_attention_mask
 from ..rendering import PangoCairoTextRenderer, PyGameTextRenderer
@@ -48,8 +50,27 @@ if is_torch_available():
             max_seq_length: Optional[int] = None,
             overwrite_cache=False,
             mode: Split = Split.TRAIN,
+            augment_prob: float = 0.0,
+            arabic_reshape: bool = False,
+            transliterate: bool = False,
             **kwargs,
         ):
+            self.processor = processor
+            self.labels = labels
+            self.transforms = transforms
+            self.max_seq_length = max_seq_length
+            self.mode = mode
+            self.augment_prob = augment_prob
+            self.arabic_reshape = arabic_reshape
+            self.transliterate = transliterate
+
+            if self.arabic_reshape and self.transliterate:
+                raise ValueError("Both arabic_reshape and transliterate cannot be True at the same time.")
+            
+            self.examples = read_examples_from_file(data_dir, mode, arabic_reshape=self.arabic_reshape, transliterate=self.transliterate)
+            if mode == Split.TRAIN and self.augment_prob > 0:
+                # when using allographic augmentation, we do not cache the dataset
+                return
 
             # Load data features from cache or dataset file
             cached_features_file = os.path.join(
@@ -64,11 +85,9 @@ if is_torch_available():
 
                 if os.path.exists(cached_features_file) and not overwrite_cache:
                     logger.info(f"Loading features from cached file {cached_features_file}")
-                    self.examples = read_examples_from_file(data_dir, mode)
                     self.features = torch.load(cached_features_file)
                 else:
                     logger.info(f"Creating features from dataset file at {data_dir}")
-                    self.examples = read_examples_from_file(data_dir, mode)
                     examples_to_features_fn = _get_examples_to_features_fn(modality)
                     # Also store pad_token because we need this later on if we want to log truncated predictions
                     self.features, self.pad_token = examples_to_features_fn(
@@ -83,11 +102,26 @@ if is_torch_available():
                     torch.save(self.features, cached_features_file)
 
         def __len__(self):
-            return len(self.features)
+            return len(self.examples)
 
         def __getitem__(self, i) -> Dict[str, Union[int, torch.Tensor]]:
-            return self.features[i]
+            # WARN: This assumes image modality
+            if self.mode == Split.TRAIN and self.augment_prob > 0:
+                # do augmentation on the fly during training
+                example = self.examples[i]
+                example.words = [get_allographic_variant(w) for w in example.words]
+                feature = convert_example_to_image_features(example,
+                                                             self.labels,
+                                                             self.max_seq_length,
+                                                             self.processor,
+                                                             self.transforms)
+                return feature
+            else:
+                return self.features[i]
 
+# TODO: Export this function to a general utils file
+def get_allographic_variant(word: str) -> str:
+    return word[::-1]  # Dummy implementation: reverse the word
 
 def get_file(data_dir: str, mode: Union[Split, str]) -> Optional[str]:
     if isinstance(mode, Split):
@@ -105,9 +139,10 @@ def get_file(data_dir: str, mode: Union[Split, str]) -> Optional[str]:
         raise ValueError(f"Unsupported mode: {mode}")
 
 
-def read_examples_from_file(data_dir, mode: Union[Split, str]) -> List[UDInputExample]:
+def read_examples_from_file(data_dir, mode: Union[Split, str], arabic_reshape: bool = False, transliterate: bool = False) -> List[UDInputExample]:
     file_path = get_file(data_dir, mode)
     examples = []
+    transliterator = CharMapper.builtin_mapper('ar2hsb')
 
     with open(file_path, "r", encoding="utf-8") as f:
         words: List[str] = []
@@ -123,6 +158,10 @@ def read_examples_from_file(data_dir, mode: Union[Split, str]) -> List[UDInputEx
                     rel_labels = []
             if tok[0].isdigit():
                 word, head, label = tok[1], tok[6], tok[7]
+                if transliterate:
+                    word = transliterator(word)
+                if arabic_reshape:
+                    word = arabic_reshaper.reshape(word)
                 words.append(word)
                 head_labels.append(int(head))
                 rel_labels.append(label.split(":")[0])
@@ -139,6 +178,56 @@ def _get_examples_to_features_fn(modality: Modality):
     else:
         raise ValueError("Modality not supported.")
 
+def convert_example_to_image_features(
+    example: UDInputExample,
+    label_list: List[str],
+    max_seq_length: int,
+    processor: Union[PyGameTextRenderer, PangoCairoTextRenderer],
+    transforms: Optional[Callable] = None,
+    pad_token=-100,
+) -> Dict[str, Union[int, torch.Tensor]]:
+    """Converts a single `UDInputExample` into a `Dict` containing image features"""
+
+    label_map = {label: i for i, label in enumerate(label_list)}
+
+    encoding = processor(example.words)
+    image = encoding.pixel_values
+    num_patches = encoding.num_text_patches
+    word_starts = encoding.word_starts
+
+    pixel_values = transforms(Image.fromarray(image))
+    attention_mask = get_attention_mask(num_patches, seq_length=max_seq_length)
+
+    pad_item = [pad_token]
+
+    if len(example.head_labels) > max_seq_length:
+        logger.warning("Sequence of len %d truncated: %s", len(example.head_labels), example.words)
+
+    # pad or truncate arc labels
+    arc_labels = example.head_labels[: min(max_seq_length, len(example.head_labels))]
+    arc_labels = [pad_token if al > max_seq_length else al for al in arc_labels]
+    arc_labels = arc_labels + (max_seq_length - len(arc_labels)) * pad_item
+
+    # convert rel labels from map, pad or truncate if necessary
+    rel_labels = [label_map[i] for i in example.rel_labels[: min(max_seq_length, len(example.rel_labels))]]
+    rel_labels = rel_labels + (max_seq_length - len(rel_labels)) * pad_item
+
+    # determine start indices of words, pad or truncate if necessary
+    word_starts = word_starts + (max_seq_length + 1 - len(word_starts)) * pad_item
+
+    # sanity check lengths
+    assert len(attention_mask) == max_seq_length
+    assert len(arc_labels) == max_seq_length
+    assert len(rel_labels) == max_seq_length
+    assert len(word_starts) == max_seq_length + 1
+
+    return {
+        "pixel_values": pixel_values,
+        "attention_mask": attention_mask,
+        "word_starts": word_starts,
+        "arc_labels": arc_labels,
+        "rel_labels": rel_labels,
+    }
 
 def convert_examples_to_image_features(
     examples: List[UDInputExample],
@@ -158,54 +247,15 @@ def convert_examples_to_image_features(
         if ex_index % 10_000 == 0:
             logger.info(f"Writing example {ex_index} of {len(examples)}")
 
-        encoding = processor(example.words)
-        image = encoding.pixel_values
-        num_patches = encoding.num_text_patches
-        word_starts = encoding.word_starts
-
-        pixel_values = transforms(Image.fromarray(image))
-        attention_mask = get_attention_mask(num_patches, seq_length=max_seq_length)
-
-        pad_item = [pad_token]
-
-        if len(example.head_labels) > max_seq_length:
-            logger.warning("Sequence %d of len %d truncated: %s", ex_index, len(example.head_labels), example.words)
-
-        # pad or truncate arc labels
-        arc_labels = example.head_labels[: min(max_seq_length, len(example.head_labels))]
-        arc_labels = [pad_token if al > max_seq_length else al for al in arc_labels]
-        arc_labels = arc_labels + (max_seq_length - len(arc_labels)) * pad_item
-
-        # convert rel labels from map, pad or truncate if necessary
-        rel_labels = [label_map[i] for i in example.rel_labels[: min(max_seq_length, len(example.rel_labels))]]
-        rel_labels = rel_labels + (max_seq_length - len(rel_labels)) * pad_item
-
-        # determine start indices of words, pad or truncate if necessary
-        word_starts = word_starts + (max_seq_length + 1 - len(word_starts)) * pad_item
-
-        # sanity check lengths
-        assert len(attention_mask) == max_seq_length
-        assert len(arc_labels) == max_seq_length
-        assert len(rel_labels) == max_seq_length
-        assert len(word_starts) == max_seq_length + 1
-
-        if ex_index < 5:
-            logger.info("*** Example ***")
-            logger.info(f"sentence: {' '.join(example.words)}")
-            logger.info(f"attention_mask: {attention_mask}")
-            logger.info(f"arc_labels: {arc_labels}")
-            logger.info(f"rel_labels: {rel_labels}")
-            logger.info(f"word_starts: {word_starts}")
-
-        features.append(
-            {
-                "pixel_values": pixel_values,
-                "attention_mask": attention_mask,
-                "word_starts": word_starts,
-                "arc_labels": arc_labels,
-                "rel_labels": rel_labels,
-            }
+        feature = convert_example_to_image_features(
+            example,
+            label_list,
+            max_seq_length,
+            processor,
+            transforms,
+            pad_token,
         )
+        features.append(feature)
 
     return features, pad_token
 

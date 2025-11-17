@@ -40,6 +40,7 @@ from pixel import (
     get_transforms,
     resize_model_embeddings,
 )
+from pixel.utils.defaults import DEFAULT_FONT_SIZE
 from transformers import (
     AutoTokenizer,
     EarlyStoppingCallback,
@@ -85,6 +86,16 @@ class DataTrainingArguments:
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
     )
+    augment_prob: Optional[float] = field(
+        default=0.0, metadata={"help": "Probability of applying data augmentation to each training example"}
+    )
+    arabic_reshape: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to apply Arabic reshaping when rendering Arabic text"}
+    )
+    transliterate: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to apply HSB transliteration when rendering Arabic text"}
+    )
+
 
 
 @dataclass
@@ -139,6 +150,9 @@ class ModelArguments:
     )
     dropout_prob: float = field(
         default=0.1, metadata={"help": "Dropout probability for attention blocks and classification head"}
+    )
+    font_size: Optional[int] = field(
+        default=DEFAULT_FONT_SIZE, metadata={"help": "Font size to use for rendering with PIXEL"}
     )
 
     def __post_init__(self):
@@ -220,7 +234,10 @@ def get_dataset(
         max_seq_length=data_args.max_seq_length,
         overwrite_cache=data_args.overwrite_cache,
         mode=split,
-        pad_token=config.pad_token_id
+        pad_token=config.pad_token_id,
+        augment_prob=data_args.augment_prob,
+        arabic_reshape=data_args.arabic_reshape,
+        transliterate=data_args.transliterate,
     )
 
 
@@ -242,12 +259,17 @@ def get_processor(model_args: argparse.Namespace, modality: Modality):
     elif modality == Modality.IMAGE:
         renderer_cls = PangoCairoBigramsRenderer
         # renderer_cls = PyGameTextRenderer if model_args.rendering_backend == "pygame" else PangoCairoBigramsRenderer
-        processor = renderer_cls.from_pretrained(
-            model_args.processor_name if model_args.processor_name else model_args.model_name_or_path,
-            fallback_fonts_dir=model_args.fallback_fonts_dir,
-            rgb=model_args.render_rgb,
-            **config_kwargs,
-        )
+        # processor = renderer_cls.from_pretrained(
+        #     model_args.processor_name if model_args.processor_name else model_args.model_name_or_path,
+        #     fallback_fonts_dir=model_args.fallback_fonts_dir,
+        #     rgb=model_args.render_rgb,
+        #     **config_kwargs,
+        # )
+        processor = renderer_cls(font_file="/home/bens/pixel/configs/renderers/noto_renderer/GoNotoCurrent.ttf", 
+                                 font_size=model_args.font_size, 
+                                 fallback_fonts_dir=model_args.fallback_fonts_dir, 
+                                 rgb=model_args.render_rgb)
+        logger.info(f"Using font size {model_args.font_size} for rendering with PIXEL.")
     else:
         raise ValueError(f"Modality {modality} not supported.")
 
