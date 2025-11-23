@@ -45,7 +45,7 @@ from pixel import (
     get_attention_mask,
     get_transforms,
     glue_strip_spaces,
-    log_sequence_classification_predictions,
+    # log_sequence_classification_predictions,
     resize_model_embeddings,
 )
 from transformers import (
@@ -64,6 +64,9 @@ from transformers.utils.versions import require_version
 from sklearn.metrics import f1_score as compute_f1_score
 
 from pixel.data.rendering.pangocairo_renderer_bigrams_iso_char import PangoCairoTextRenderer as PangoCairoBigramsRenderer
+
+from camel_tools.utils.charmap import CharMapper
+import arabic_reshaper
 
 check_min_version("4.17.0")
 
@@ -254,14 +257,16 @@ def get_processor(model_args: argparse.Namespace, modality: Modality):
             renderer_cls = PangoCairoTextRenderer
         else:
             renderer_cls = PangoCairoBigramsRenderer
-        processor = renderer_cls.from_pretrained(
-            model_args.processor_name if model_args.processor_name else model_args.model_name_or_path,
-            cache_dir=model_args.cache_dir,
-            revision=model_args.model_revision,
-            use_auth_token=model_args.use_auth_token if model_args.use_auth_token else None,
-            fallback_fonts_dir=model_args.fallback_fonts_dir,
-            rgb=model_args.render_rgb,
-        )
+        # processor = renderer_cls.from_pretrained(
+        #     model_args.processor_name if model_args.processor_name else model_args.model_name_or_path,
+        #     cache_dir=model_args.cache_dir,
+        #     revision=model_args.model_revision,
+        #     use_auth_token=model_args.use_auth_token if model_args.use_auth_token else None,
+        #     fallback_fonts_dir=model_args.fallback_fonts_dir,
+        #     rgb=model_args.render_rgb,
+        # )
+        processor = renderer_cls(font_file="/home/bens/pixel/configs/renderers/noto_renderer/GoNotoCurrent.ttf", font_size=7,
+                                 cache_dir=model_args.cache_dir, fallback_fonts_dir=model_args.fallback_fonts_dir, rgb=model_args.render_rgb)
     else:
         raise ValueError("Modality not supported.")
     return processor
@@ -438,6 +443,9 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
+    # Load transliterator
+    transliterator = CharMapper.builtin_mapper('ar2hsb')
+
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
     #
@@ -457,6 +465,11 @@ def main():
         category2id = {category: idx for idx, category in enumerate(categories)}
         add_label_id = lambda example: {"label": category2id[example["category"]]}
         raw_datasets = raw_datasets.map(add_label_id)
+        # transliterate_text = lambda example: {"text": transliterator(example["text"])}
+        # raw_datasets = raw_datasets.map(transliterate_text)
+        # reshape_text = lambda example: {"text": arabic_reshaper.reshape(example["text"])}
+        # raw_datasets = raw_datasets.map(reshape_text)
+
     elif data_args.data_dir is not None:
         assert data_args.language is not None
         lang_data_dir = os.path.join(os.path.abspath(data_args.data_dir), data_args.language)
@@ -465,6 +478,11 @@ def main():
         category2id = {category: idx for idx, category in enumerate(categories)}
         add_label_id = lambda example: {"label": category2id[example["category"]]}
         raw_datasets = raw_datasets.map(add_label_id)
+        # transliterate_text = lambda example: {"text": transliterator(example["text"])}
+        # raw_datasets = raw_datasets.map(transliterate_text)
+        # reshape_text = lambda example: {"text": arabic_reshaper.reshape(example["text"])}
+        # raw_datasets = raw_datasets.map(reshape_text)
+
     elif data_args.dataset_name is not None:
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(

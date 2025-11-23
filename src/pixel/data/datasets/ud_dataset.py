@@ -5,12 +5,12 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from pixel.data.processing.arabic_utils import reshape_arabic_text, HSB_transliterate, get_allographic_variant
 import torch
 from filelock import FileLock
 from PIL import Image
 from transformers import PreTrainedTokenizerFast, is_torch_available
-from camel_tools.utils.charmap import CharMapper
-import arabic_reshaper
+
 
 from ...utils import Modality, Split, get_attention_mask
 from ..rendering import PangoCairoTextRenderer, PyGameTextRenderer
@@ -109,8 +109,11 @@ if is_torch_available():
             if self.mode == Split.TRAIN and self.augment_prob > 0:
                 # do augmentation on the fly during training
                 example = self.examples[i]
-                example.words = [get_allographic_variant(w) for w in example.words]
-                feature = convert_example_to_image_features(example,
+                words = [get_allographic_variant(w, self.augment_prob) for w in example.words]
+                feature = convert_example_to_image_features(
+                                                             words,
+                                                             example.head_labels,
+                                                             example.rel_labels,
                                                              self.labels,
                                                              self.max_seq_length,
                                                              self.processor,
@@ -119,9 +122,6 @@ if is_torch_available():
             else:
                 return self.features[i]
 
-# TODO: Export this function to a general utils file
-def get_allographic_variant(word: str) -> str:
-    return word[::-1]  # Dummy implementation: reverse the word
 
 def get_file(data_dir: str, mode: Union[Split, str]) -> Optional[str]:
     if isinstance(mode, Split):
@@ -142,7 +142,6 @@ def get_file(data_dir: str, mode: Union[Split, str]) -> Optional[str]:
 def read_examples_from_file(data_dir, mode: Union[Split, str], arabic_reshape: bool = False, transliterate: bool = False) -> List[UDInputExample]:
     file_path = get_file(data_dir, mode)
     examples = []
-    transliterator = CharMapper.builtin_mapper('ar2hsb')
 
     with open(file_path, "r", encoding="utf-8") as f:
         words: List[str] = []
@@ -159,9 +158,9 @@ def read_examples_from_file(data_dir, mode: Union[Split, str], arabic_reshape: b
             if tok[0].isdigit():
                 word, head, label = tok[1], tok[6], tok[7]
                 if transliterate:
-                    word = transliterator(word)
+                    word = HSB_transliterate(word)
                 if arabic_reshape:
-                    word = arabic_reshaper.reshape(word)
+                    word = reshape_arabic_text(word)
                 words.append(word)
                 head_labels.append(int(head))
                 rel_labels.append(label.split(":")[0])
@@ -179,7 +178,9 @@ def _get_examples_to_features_fn(modality: Modality):
         raise ValueError("Modality not supported.")
 
 def convert_example_to_image_features(
-    example: UDInputExample,
+    words: List[str],
+    head_labels: List[int],
+    rel_labels: List[str],
     label_list: List[str],
     max_seq_length: int,
     processor: Union[PyGameTextRenderer, PangoCairoTextRenderer],
@@ -190,7 +191,7 @@ def convert_example_to_image_features(
 
     label_map = {label: i for i, label in enumerate(label_list)}
 
-    encoding = processor(example.words)
+    encoding = processor(words)
     image = encoding.pixel_values
     num_patches = encoding.num_text_patches
     word_starts = encoding.word_starts
@@ -200,16 +201,16 @@ def convert_example_to_image_features(
 
     pad_item = [pad_token]
 
-    if len(example.head_labels) > max_seq_length:
-        logger.warning("Sequence of len %d truncated: %s", len(example.head_labels), example.words)
+    if len(head_labels) > max_seq_length:
+        logger.warning("Sequence of len %d truncated: %s", len(head_labels), words)
 
     # pad or truncate arc labels
-    arc_labels = example.head_labels[: min(max_seq_length, len(example.head_labels))]
+    arc_labels = head_labels[: min(max_seq_length, len(head_labels))]
     arc_labels = [pad_token if al > max_seq_length else al for al in arc_labels]
     arc_labels = arc_labels + (max_seq_length - len(arc_labels)) * pad_item
 
     # convert rel labels from map, pad or truncate if necessary
-    rel_labels = [label_map[i] for i in example.rel_labels[: min(max_seq_length, len(example.rel_labels))]]
+    rel_labels = [label_map[i] for i in rel_labels[: min(max_seq_length, len(rel_labels))]]
     rel_labels = rel_labels + (max_seq_length - len(rel_labels)) * pad_item
 
     # determine start indices of words, pad or truncate if necessary
@@ -248,7 +249,9 @@ def convert_examples_to_image_features(
             logger.info(f"Writing example {ex_index} of {len(examples)}")
 
         feature = convert_example_to_image_features(
-            example,
+            example.words,
+            example.head_labels,
+            example.rel_labels,
             label_list,
             max_seq_length,
             processor,
